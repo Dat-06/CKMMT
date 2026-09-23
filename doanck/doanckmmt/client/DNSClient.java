@@ -9,28 +9,24 @@ import java.nio.charset.StandardCharsets;
 
 public class DNSClient {
 
-    private static String serverIp = "127.0.0.1"; // Mặc định localhost
-    private static int serverPort = 5353;         // Cổng mặc định cho Server nhóm
-
     public static void main(String[] args) {
-        if (args.length < 1) {
-            System.out.println("==========================================================================");
-            System.out.println("Cú pháp: java DNSClient <domain-hoặc-ip> [Type] [Server_IP] [Server_Port]");
-            System.out.println("Ví dụ tra cứu Server Máy B : java DNSClient nhom14.local A 192.168.1.15 5353");
-            System.out.println("Ví dụ tra cứu Google DNS   : java DNSClient google.com A 8.8.8.8 53");
-            System.out.println("Ví dụ tra cứu ngược PTR   : java DNSClient 8.8.8.8 PTR 8.8.8.8 53");
-            System.out.println("==========================================================================");
-            return;
-        }
+        // Cấu hình tham số mặc định
+        String domain = "nhom14.local";
+        String type = "A";
+        String serverIp = "100.92.122.114"; // Địa chỉ IP Tailscale máy Server của bạn
+        int port = 5354;                   // Cổng UDP Server mới
 
-        String target = args[0];
-        String queryTypeStr = (args.length > 1) ? args[1].toUpperCase() : "A";
+        // Nếu người dùng có truyền tham số qua CMD thì lấy, không thì dùng giá trị mặc định ở trên
+        if (args.length >= 1) domain = args[0];
+        if (args.length >= 2) type = args[1].toUpperCase();
+        if (args.length >= 3) serverIp = args[2];
+        if (args.length >= 4) port = Integer.parseInt(args[3]);
 
-        if (args.length > 2) serverIp = args[2];
-        if (args.length > 3) serverPort = Integer.parseInt(args[3]);
+        String target = domain;
+        String queryTypeStr = type;
 
-        // Nhận diện IP tự chuyển sang PTR nếu không nhập type
-        if (isIPv4(target) && args.length == 1) {
+        // Nhận diện IP tự chuyển sang PTR nếu tra cứu ngược
+        if (isIPv4(target) && args.length <= 2) {
             queryTypeStr = "PTR";
         }
 
@@ -42,11 +38,11 @@ public class DNSClient {
         }
 
         try {
-            System.out.println("\n[+] Đang gửi câu hỏi đến DNS Server [" + serverIp + ":" + serverPort + "]...");
+            System.out.println("\n[+] Đang gửi câu hỏi đến DNS Server [" + serverIp + ":" + port + "]...");
             System.out.println("[+] Tra cứu: " + target + " (Record: " + queryTypeStr + ")");
 
             long startTime = System.currentTimeMillis(); // Đo thời gian phản hồi
-            byte[] responseBuffer = sendDNSQuery(serverIp, serverPort, formattedDomain, queryType);
+            byte[] responseBuffer = sendDNSQuery(serverIp, port, formattedDomain, queryType);
             long endTime = System.currentTimeMillis();
 
             System.out.println("[+] Thời gian phản hồi (Latency): " + (endTime - startTime) + " ms");

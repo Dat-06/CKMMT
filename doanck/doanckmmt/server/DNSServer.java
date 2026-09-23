@@ -11,7 +11,7 @@ import java.util.Map;
 
 public class DNSServer {
 
-    private static final int PORT = 5353; // Cổng UDP Server lắng nghe
+    private static final int PORT = 5354; // Cổng UDP Server lắng nghe
     private static final Map<String, String> dnsTable = new HashMap<>();
 
     public static void main(String[] args) {
