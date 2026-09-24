@@ -10,78 +10,63 @@ import java.nio.charset.StandardCharsets;
 public class DNSClient {
 
     public static void main(String[] args) {
-        // Cấu hình tham số mặc định
-        String domain = "nhom14.local";
+        // Có thể thay đổi domain thành facebook.com, google.com, youtube.com...
+        String domain = "facebook.com";
         String type = "A";
-        String serverIp = "100.92.122.114"; // Địa chỉ IP Tailscale máy Server của bạn
-        int port = 5354;                   // Cổng UDP Server mới
+        String serverIp = "100.92.122.114"; // IP Tailscale Server của bạn
+        int port = 5354;
 
-        // Nếu người dùng có truyền tham số qua CMD thì lấy, không thì dùng giá trị mặc định ở trên
         if (args.length >= 1) domain = args[0];
         if (args.length >= 2) type = args[1].toUpperCase();
         if (args.length >= 3) serverIp = args[2];
         if (args.length >= 4) port = Integer.parseInt(args[3]);
 
-        String target = domain;
-        String queryTypeStr = type;
-
-        // Nhận diện IP tự chuyển sang PTR nếu tra cứu ngược
-        if (isIPv4(target) && args.length <= 2) {
-            queryTypeStr = "PTR";
-        }
-
-        int queryType = getRecordTypeNum(queryTypeStr);
-        String formattedDomain = target;
-
-        if (queryTypeStr.equals("PTR") && isIPv4(target)) {
-            formattedDomain = reverseIPv4Domain(target);
-        }
+        System.out.println("==========================================================================");
+        System.out.println("                 DNS CLIENT - CÔNG CỤ TRA CỨU DNS                         ");
+        System.out.println("==========================================================================");
+        System.out.println("[+] Target Server  : " + serverIp + ":" + port);
+        System.out.println("[+] Query Domain   : " + domain);
+        System.out.println("[+] Record Type    : " + type);
 
         try {
-            System.out.println("\n[+] Đang gửi câu hỏi đến DNS Server [" + serverIp + ":" + port + "]...");
-            System.out.println("[+] Tra cứu: " + target + " (Record: " + queryTypeStr + ")");
+            long startTime = System.currentTimeMillis();
+            byte[] response = sendDNSQuery(serverIp, port, domain, getRecordTypeNum(type));
+            long latency = System.currentTimeMillis() - startTime;
 
-            long startTime = System.currentTimeMillis(); // Đo thời gian phản hồi
-            byte[] responseBuffer = sendDNSQuery(serverIp, port, formattedDomain, queryType);
-            long endTime = System.currentTimeMillis();
-
-            System.out.println("[+] Thời gian phản hồi (Latency): " + (endTime - startTime) + " ms");
-            parseDNSResponse(responseBuffer);
+            System.out.println("\n[✓] KẾT NỐI THÀNH CÔNG! Thời gian phản hồi (Latency): " + latency + " ms");
+            parseDNSResponse(response);
 
         } catch (Exception e) {
-            System.err.println("[-] Lỗi: Không thể nhận dữ liệu từ DNS Server (Timeout hoặc Sai IP/Port).");
+            System.err.println("\n[-] Lỗi Client: " + e.getMessage());
         }
     }
 
     private static byte[] sendDNSQuery(String dnsServer, int port, String domain, int queryType) throws Exception {
         ByteArrayOutputStream queryStream = new ByteArrayOutputStream();
 
-        // 1. DNS HEADER (12 Bytes)
         ByteBuffer header = ByteBuffer.allocate(12);
-        header.putShort((short) (Math.random() * 0xFFFF)); // Transaction ID
-        header.putShort((short) 0x0100);                    // Flags: Recursion Desired
-        header.putShort((short) 1);                         // QDCOUNT = 1
-        header.putShort((short) 0);                         // ANCOUNT
-        header.putShort((short) 0);                         // NSCOUNT
-        header.putShort((short) 0);                         // ARCOUNT
+        header.putShort((short) (Math.random() * 0xFFFF));
+        header.putShort((short) 0x0100);
+        header.putShort((short) 1);
+        header.putShort((short) 0);
+        header.putShort((short) 0);
+        header.putShort((short) 0);
         queryStream.write(header.array());
 
-        // 2. QUESTION SECTION
         String[] labels = domain.split("\\.");
         for (String label : labels) {
             queryStream.write(label.length());
             queryStream.write(label.getBytes(StandardCharsets.UTF_8));
         }
-        queryStream.write(0); // Byte 0x00 kết thúc
+        queryStream.write(0);
 
         ByteBuffer qFields = ByteBuffer.allocate(4);
         qFields.putShort((short) queryType);
-        qFields.putShort((short) 1); // QCLASS = IN
+        qFields.putShort((short) 1);
         queryStream.write(qFields.array());
 
-        // 3. GUI QUA UDP SOCKET
         try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setSoTimeout(3000); // Timeout 3 giây
+            socket.setSoTimeout(4000);
             InetAddress serverAddr = InetAddress.getByName(dnsServer);
             byte[] queryData = queryStream.toByteArray();
 
@@ -92,56 +77,60 @@ public class DNSClient {
             DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
             socket.receive(receivePacket);
 
-            return receivePacket.getData();
+            byte[] actualData = new byte[receivePacket.getLength()];
+            System.arraycopy(receiveBuffer, 0, actualData, 0, receivePacket.getLength());
+            return actualData;
         }
     }
 
     private static void parseDNSResponse(byte[] response) {
         ByteBuffer buffer = ByteBuffer.wrap(response);
 
-        buffer.getShort(); // Skip ID
+        buffer.getShort();
         short flags = buffer.getShort();
         short qdCount = buffer.getShort();
         short anCount = buffer.getShort();
-        buffer.getShort(); buffer.getShort(); // Skip NS & AR Count
+        buffer.getShort(); buffer.getShort();
 
         int rcode = flags & 0x000F;
         if (rcode != 0) {
-            System.out.println("[-] Máy chủ DNS trả về lỗi (RCODE = " + rcode + "). Không tìm thấy tên miền!");
+            System.out.println("[-] DNS Server báo lỗi (RCODE = " + rcode + "). Không tìm thấy bản ghi!");
             return;
         }
 
-        System.out.println("\n[=>] KẾT QUẢ TRẢ VỀ (" + anCount + " bản ghi):");
+        System.out.println("\n[=>] KẾT QUẢ PHÂN TÍCH GÓI TIN RESPONSE (" + anCount + " Answer Records):");
 
-        // Bỏ qua Question
         for (int i = 0; i < qdCount; i++) {
             readDomainName(buffer, response);
             buffer.getShort(); buffer.getShort();
         }
 
-        // Đọc Answers
         for (int i = 0; i < anCount; i++) {
             String name = readDomainName(buffer, response);
             int type = buffer.getShort() & 0xFFFF;
-            buffer.getShort(); // Skip Class
+            buffer.getShort();
             int ttl = buffer.getInt();
             int rdLength = buffer.getShort() & 0xFFFF;
 
-            System.out.print("   • " + name + " [TTL: " + ttl + "s] -> ");
+            System.out.print("   📌 [" + getRecordTypeName(type) + "] " + name + " (TTL: " + ttl + "s) -> ");
 
-            if (type == 1 && rdLength == 4) { // Record A
+            if (type == 1 && rdLength == 4) {
                 byte[] ipBytes = new byte[4];
                 buffer.get(ipBytes);
                 try {
-                    InetAddress ip = InetAddress.getByAddress(ipBytes);
-                    System.out.println("Địa chỉ IPv4: " + ip.getHostAddress());
+                    System.out.println(InetAddress.getByAddress(ipBytes).getHostAddress());
                 } catch (Exception e) {}
-            } else if (type == 12 || type == 5) { // PTR hoặc CNAME
-                String targetName = readDomainName(buffer, response);
-                System.out.println("Tên miền trỏ đến: " + targetName);
+            } else if (type == 28 && rdLength == 16) {
+                byte[] ipBytes = new byte[16];
+                buffer.get(ipBytes);
+                try {
+                    System.out.println(InetAddress.getByAddress(ipBytes).getHostAddress());
+                } catch (Exception e) {}
+            } else if (type == 5 || type == 12) {
+                System.out.println(readDomainName(buffer, response));
             } else {
                 buffer.position(buffer.position() + rdLength);
-                System.out.println("Record Type " + type + " (Đã nhận " + rdLength + " bytes)");
+                System.out.println("Raw Data (" + rdLength + " bytes)");
             }
         }
         System.out.println();
@@ -152,7 +141,7 @@ public class DNSClient {
         boolean jumped = false;
         int originalPosition = -1;
 
-        while (true) {
+        while (buffer.hasRemaining()) {
             int length = buffer.get() & 0xFF;
             if ((length & 0xC0) == 0xC0) {
                 if (!jumped) originalPosition = buffer.position() + 1;
@@ -179,16 +168,21 @@ public class DNSClient {
             case "CNAME": return 5;
             case "PTR": return 12;
             case "MX": return 15;
+            case "TXT": return 16;
+            case "AAAA": return 28;
             default: return 1;
         }
     }
 
-    private static boolean isIPv4(String input) {
-        return input.matches("^(\\d{1,3}\\.){3}\\d{1,3}$");
-    }
-
-    private static String reverseIPv4Domain(String ip) {
-        String[] parts = ip.split("\\.");
-        return parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0] + ".in-addr.arpa";
+    private static String getRecordTypeName(int type) {
+        switch (type) {
+            case 1: return "IPv4 (A)";
+            case 28: return "IPv6 (AAAA)";
+            case 5: return "CNAME";
+            case 15: return "MX";
+            case 16: return "TXT";
+            case 12: return "PTR";
+            default: return "TYPE_" + type;
+        }
     }
 }

@@ -1,165 +1,249 @@
 package doanckmmt.server;
 
-import java.io.ByteArrayOutputStream;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
+import java.io.*;
+import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class DNSServer {
 
-    private static final int PORT = 5354; // Cổng UDP Server lắng nghe
-    private static final Map<String, String> dnsTable = new HashMap<>();
+    private static final int PORT = 5354;
+    private static final String UPSTREAM_DNS = "8.8.8.8"; // Google Public DNS
+    private static final int UPSTREAM_PORT = 53;
+    private static final String LOG_FILE = "dns_server.log";
+
+    // 1. Database DNS Nội bộ
+    private static final Map<String, String> localDnsTable = new HashMap<>();
+
+    // 2. Bộ nhớ đệm Cache (Thread-safe)
+    private static class CacheEntry {
+        byte[] responseData;
+        long expireTimeMs;
+
+        CacheEntry(byte[] responseData, long ttlSeconds) {
+            this.responseData = responseData;
+            this.expireTimeMs = System.currentTimeMillis() + (ttlSeconds * 1000);
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() > expireTimeMs;
+        }
+    }
+    private static final Map<String, CacheEntry> cacheMap = new ConcurrentHashMap<>();
+
+    // 3. Thống kê Metrics
+    private static int totalRequests = 0;
+    private static int localHits = 0;
+    private static int cacheHits = 0;
+    private static int forwardedRequests = 0;
 
     public static void main(String[] args) {
-        // 1. Khởi tạo Cơ sở dữ liệu DNS giả lập của nhóm
-        initDNSTable();
+        initLocalDNSTable();
 
-        System.out.println("=================================================");
-        System.out.println("   DNS SERVER NỘI BỘ (MÔ HÌNH CLIENT - SERVER)   ");
-        System.out.println("=================================================");
-        System.out.println("[+] Server đang chạy và lắng nghe tại cổng UDP: " + PORT);
-        System.out.println("[+] Đã tải " + dnsTable.size() + " bản ghi DNS nội bộ.");
-        System.out.println("[+] Đang chờ truy vấn từ DNS Client...\n");
+        System.out.println("=================================================================");
+        System.out.println("   HỆ THỐNG DNS SERVER NÂNG CAO (FORWARDER + CACHING + LOGGING)  ");
+        System.out.println("=================================================================");
+        System.out.println("[+] Listening Port UDP      : " + PORT);
+        System.out.println("[+] Upstream Forwarder DNS  : " + UPSTREAM_DNS + ":" + UPSTREAM_PORT);
+        System.out.println("[+] Local Records Loaded    : " + localDnsTable.size());
+        System.out.println("[+] Log File Active         : " + LOG_FILE);
+        System.out.println("[+] Đang chờ kết nối từ Client...\n");
+
+        logToFile("=== DNS SERVER STARTED ON PORT " + PORT + " ===");
 
         try (DatagramSocket socket = new DatagramSocket(PORT)) {
             byte[] receiveBuffer = new byte[1024];
 
             while (true) {
-                // Nhận gói tin Query từ Máy A (Client)
                 DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
                 socket.receive(receivePacket);
 
+                totalRequests++;
                 InetAddress clientAddress = receivePacket.getAddress();
                 int clientPort = receivePacket.getPort();
+                byte[] requestData = Arrays.copyOf(receivePacket.getData(), receivePacket.getLength());
 
-                System.out.println("-------------------------------------------------");
-                System.out.println("[!] Nhận yêu cầu truy vấn từ Client IP: " + clientAddress.getHostAddress() + ":" + clientPort);
+                long startTime = System.currentTimeMillis();
 
-                // Tạo gói tin Response trả lời
-                byte[] responseData = processQueryAndBuildResponse(receivePacket.getData());
+                String domain = extractDomainName(requestData);
+                int qType = extractQueryType(requestData);
+                String cacheKey = domain.toLowerCase() + "_" + qType;
 
-                // Gửi trả gói tin Response về cho Máy A
-                DatagramPacket sendPacket = new DatagramPacket(
-                        responseData, responseData.length, clientAddress, clientPort
-                );
-                socket.send(sendPacket);
-                System.out.println("[=>] Đã gửi gói tin DNS Response trả lời cho Client.");
+                System.out.println("-----------------------------------------------------------------");
+                System.out.println("[# " + totalRequests + "] Query từ Client: " + clientAddress.getHostAddress() + ":" + clientPort);
+                System.out.println("    + Domain   : [" + domain + "]");
+                System.out.println("    + Record   : " + getRecordTypeName(qType) + " (Type " + qType + ")");
+
+                byte[] responseData = null;
+                String statusLog = "";
+
+                // STRATEGY 1: Kiểm tra Database nội bộ
+                if (localDnsTable.containsKey(domain.toLowerCase())) {
+                    responseData = buildLocalResponse(requestData, domain, qType);
+                    localHits++;
+                    statusLog = "LOCAL DB HIT";
+                    System.out.println("    [✓] Nguồn: " + statusLog + " -> " + localDnsTable.get(domain.toLowerCase()));
+                }
+                // STRATEGY 2: Kiểm tra Bộ nhớ đệm Cache
+                else if (cacheMap.containsKey(cacheKey) && !cacheMap.get(cacheKey).isExpired()) {
+                    byte[] cachedRaw = cacheMap.get(cacheKey).responseData;
+                    responseData = syncTransactionId(cachedRaw, requestData);
+                    cacheHits++;
+                    statusLog = "CACHE HIT (0ms)";
+                    System.out.println("    [⚡] Nguồn: " + statusLog);
+                }
+                // STRATEGY 3: Forward đệ quy lên Google DNS (8.8.8.8)
+                else {
+                    responseData = forwardToUpstream(requestData);
+                    if (responseData != null) {
+                        forwardedRequests++;
+                        statusLog = "FORWARDED (Google DNS 8.8.8.8)";
+                        cacheMap.put(cacheKey, new CacheEntry(responseData, 60)); // Cache trong 60 giây
+                        System.out.println("    [🌐] Nguồn: " + statusLog + " (Đã lưu Cache 60s)");
+                    } else {
+                        statusLog = "ERROR / TIMEOUT";
+                    }
+                }
+
+                // Gửi câu trả lời về cho Client
+                if (responseData != null) {
+                    DatagramPacket sendPacket = new DatagramPacket(responseData, responseData.length, clientAddress, clientPort);
+                    socket.send(sendPacket);
+                    long processTime = System.currentTimeMillis() - startTime;
+
+                    String logMsg = String.format("CLIENT: %s:%d | DOMAIN: %s | TYPE: %s | STATUS: %s | TIME: %dms",
+                            clientAddress.getHostAddress(), clientPort, domain, getRecordTypeName(qType), statusLog, processTime);
+                    logToFile(logMsg);
+                    System.out.println("    [=>] Đã phản hồi Client (" + processTime + " ms)");
+                }
+
+                printMetrics();
             }
         } catch (Exception e) {
-            System.err.println("[-] Lỗi Server: " + e.getMessage());
-            e.printStackTrace();
+            System.err.println("[-] Lỗi Fatal Server: " + e.getMessage());
+            logToFile("FATAL ERROR: " + e.getMessage());
         }
     }
 
-    // Khởi tạo các tên miền test của nhóm
-    private static void initDNSTable() {
-        dnsTable.put("nhom14.local", "192.168.1.100");
-        dnsTable.put("mywebsite.com", "10.0.0.88");
-        dnsTable.put("google.com", "142.250.198.46");
-        // Bản ghi ngược PTR (3.2.1.10.in-addr.arpa -> server1.local)
-        dnsTable.put("100.1.168.192.in-addr.arpa", "nhom14.local");
+    private static void initLocalDNSTable() {
+        localDnsTable.put("nhom14.local", "192.168.1.100");
+        localDnsTable.put("mywebsite.com", "10.0.0.88");
+        localDnsTable.put("100.1.168.192.in-addr.arpa", "nhom14.local");
     }
 
-    // Xử lý và đóng gói DNS Response
-    private static byte[] processQueryAndBuildResponse(byte[] request) throws Exception {
+    private static byte[] forwardToUpstream(byte[] queryData) {
+        try (DatagramSocket upstreamSocket = new DatagramSocket()) {
+            upstreamSocket.setSoTimeout(3000);
+            InetAddress googleAddr = InetAddress.getByName(UPSTREAM_DNS);
+            DatagramPacket sendPacket = new DatagramPacket(queryData, queryData.length, googleAddr, UPSTREAM_PORT);
+            upstreamSocket.send(sendPacket);
+
+            byte[] receiveBuffer = new byte[1024];
+            DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+            upstreamSocket.receive(receivePacket);
+
+            return Arrays.copyOf(receivePacket.getData(), receivePacket.getLength());
+        } catch (Exception e) {
+            System.err.println("    [!] Lỗi Forward đệ quy: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static byte[] syncTransactionId(byte[] cachedResponse, byte[] newRequest) {
+        byte[] copy = Arrays.copyOf(cachedResponse, cachedResponse.length);
+        copy[0] = newRequest[0];
+        copy[1] = newRequest[1];
+        return copy;
+    }
+
+    private static byte[] buildLocalResponse(byte[] request, String domain, int qType) throws Exception {
         ByteBuffer buffer = ByteBuffer.wrap(request);
-
-        // Đọc Header từ Client
         short id = buffer.getShort();
-        short flags = buffer.getShort();
-        short qdCount = buffer.getShort();
 
-        // Bỏ qua phần Header còn lại
-        buffer.getShort(); buffer.getShort(); buffer.getShort();
-
-        // Đọc tên miền từ phần Question
-        int questionStartPos = buffer.position();
-        String queriedDomain = readDomainName(buffer);
-        short qType = buffer.getShort();
-        short qClass = buffer.getShort();
-
-        int questionLength = buffer.position() - questionStartPos;
-
-        System.out.println("    + Domain hỏi: [" + queriedDomain + "]");
-        System.out.println("    + Record Type: " + qType);
-
-        ByteArrayOutputStream responseStream = new ByteArrayOutputStream();
-
-        // --- 1. BUILD RESPONSE HEADER (12 Bytes) ---
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
         ByteBuffer header = ByteBuffer.allocate(12);
-        header.putShort(id); // Giữ nguyên Transaction ID của Client
-        header.putShort((short) 0x8180); // Flags: Standard response, No error, Recursion Available
-        header.putShort((short) 1); // QDCOUNT = 1
+        header.putShort(id);
+        header.putShort((short) 0x8180);
+        header.putShort((short) 1);
+        header.putShort((short) 1);
+        header.putShort((short) 0);
+        header.putShort((short) 0);
+        out.write(header.array());
 
-        String resolvedIpOrDomain = dnsTable.get(queriedDomain.toLowerCase());
+        int questionLen = request.length - 12;
+        out.write(request, 12, questionLen);
 
-        if (resolvedIpOrDomain != null) {
-            header.putShort((short) 1); // ANCOUNT = 1 (Tìm thấy 1 kết quả)
-        } else {
-            header.putShort((short) 0); // ANCOUNT = 0 (Không tìm thấy domain)
+        String ip = localDnsTable.get(domain.toLowerCase());
+        ByteBuffer answerHeader = ByteBuffer.allocate(12);
+        answerHeader.putShort((short) 0xC00C);
+        answerHeader.putShort((short) qType);
+        answerHeader.putShort((short) 1);
+        answerHeader.putInt(300);
+        answerHeader.putShort((short) 4);
+        out.write(answerHeader.array());
+
+        String[] parts = ip.split("\\.");
+        for (String p : parts) {
+            out.write((byte) Integer.parseInt(p));
         }
 
-        header.putShort((short) 0); // NSCOUNT
-        header.putShort((short) 0); // ARCOUNT
-        responseStream.write(header.array());
-
-        // --- 2. COPY QUESTION SECTION (Giữ nguyên câu hỏi) ---
-        responseStream.write(request, 12, questionLength);
-
-        // --- 3. BUILD ANSWER SECTION (Nếu tìm thấy trong DB) ---
-        if (resolvedIpOrDomain != null) {
-            ByteBuffer answerHeader = ByteBuffer.allocate(12);
-            answerHeader.putShort((short) 0xC00C); // Pointer trỏ về QNAME ở byte thứ 12
-            answerHeader.putShort(qType);          // TYPE
-            answerHeader.putShort((short) 1);      // CLASS = IN
-            answerHeader.putInt(300);              // TTL = 300s
-
-            if (qType == 1) { // Record A (IPv4)
-                String[] ipParts = resolvedIpOrDomain.split("\\.");
-                byte[] ipBytes = new byte[4];
-                for (int i = 0; i < 4; i++) {
-                    ipBytes[i] = (byte) Integer.parseInt(ipParts[i]);
-                }
-                answerHeader.putShort((short) 4); // RDLENGTH = 4 bytes
-                responseStream.write(answerHeader.array());
-                responseStream.write(ipBytes);
-                System.out.println("    [✓] Tìm thấy kết quả: " + resolvedIpOrDomain);
-            } else if (qType == 12) { // Record PTR (Tra cứu ngược)
-                ByteArrayOutputStream ptrData = new ByteArrayOutputStream();
-                String[] labels = resolvedIpOrDomain.split("\\.");
-                for (String label : labels) {
-                    ptrData.write(label.length());
-                    ptrData.write(label.getBytes(StandardCharsets.UTF_8));
-                }
-                ptrData.write(0);
-                byte[] ptrBytes = ptrData.toByteArray();
-
-                answerHeader.putShort((short) ptrBytes.length); // RDLENGTH
-                responseStream.write(answerHeader.array());
-                responseStream.write(ptrBytes);
-                System.out.println("    [✓] Tìm thấy tên miền ngược: " + resolvedIpOrDomain);
-            }
-        } else {
-            System.out.println("    [X] Không tìm thấy tên miền này trong Database nội bộ.");
-        }
-
-        return responseStream.toByteArray();
+        return out.toByteArray();
     }
 
-    private static String readDomainName(ByteBuffer buffer) {
+    private static String extractDomainName(byte[] request) {
+        ByteBuffer buffer = ByteBuffer.wrap(request);
+        buffer.position(12);
         StringBuilder domain = new StringBuilder();
-        while (true) {
-            int length = buffer.get() & 0xFF;
-            if (length == 0) break;
-            byte[] label = new byte[length];
-            buffer.get(label);
-            domain.append(new String(label, StandardCharsets.UTF_8)).append(".");
+        while (buffer.hasRemaining()) {
+            int len = buffer.get() & 0xFF;
+            if (len == 0) break;
+            byte[] b = new byte[len];
+            buffer.get(b);
+            domain.append(new String(b, StandardCharsets.UTF_8)).append(".");
         }
         if (domain.length() > 0) domain.setLength(domain.length() - 1);
         return domain.toString();
+    }
+
+    private static int extractQueryType(byte[] request) {
+        ByteBuffer buffer = ByteBuffer.wrap(request);
+        buffer.position(12);
+        while (buffer.hasRemaining()) {
+            int len = buffer.get() & 0xFF;
+            if (len == 0) break;
+            buffer.position(buffer.position() + len);
+        }
+        return buffer.getShort() & 0xFFFF;
+    }
+
+    private static String getRecordTypeName(int type) {
+        switch (type) {
+            case 1: return "A (IPv4)";
+            case 28: return "AAAA (IPv6)";
+            case 5: return "CNAME";
+            case 15: return "MX";
+            case 16: return "TXT";
+            case 12: return "PTR";
+            default: return "TYPE_" + type;
+        }
+    }
+
+    private static synchronized void logToFile(String msg) {
+        try (FileWriter fw = new FileWriter(LOG_FILE, true);
+             PrintWriter pw = new PrintWriter(fw)) {
+            String time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            pw.println("[" + time + "] " + msg);
+        } catch (Exception ignored) {}
+    }
+
+    private static void printMetrics() {
+        System.out.println("    -------------------------------------------------------------");
+        System.out.println(String.format("    📊 THỐNG KÊ: Total: %d | Local: %d | Cache Hit: %d | Forwarded: %d",
+                totalRequests, localHits, cacheHits, forwardedRequests));
+        System.out.println("    -------------------------------------------------------------");
     }
 }
